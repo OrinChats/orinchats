@@ -1,0 +1,65 @@
+/**
+ * GET /api/contacts - the automation-captured audience list.
+ * Contacts are scoped to the authenticated user's connected accounts.
+ */
+
+import { getAuthenticatedUser, unauthorized } from '@/lib/auth';
+import { createServiceClient } from '@/lib/supabase/service';
+import { createLogger } from '@/lib/logger';
+
+export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
+
+const logger = createLogger('api:contacts');
+
+export async function GET(request: Request): Promise<Response> {
+  const user = await getAuthenticatedUser(request);
+  if (!user) return unauthorized();
+
+  const db = createServiceClient();
+
+  // Resolve the user's accounts first, then fetch their contacts.
+  const { data: accounts, error: accountsError } = await db
+    .from('instagram_accounts')
+    .select('id, username')
+    .eq('user_id', user.id);
+
+  if (accountsError) {
+    logger.error({ err: accountsError, userId: user.id }, 'Failed to fetch accounts for contacts');
+    return Response.json({ error: 'Falha ao buscar os contatos' }, { status: 500 });
+  }
+
+  const accountIds = (accounts ?? []).map((a) => a.id as string);
+  if (accountIds.length === 0) {
+    return Response.json({ contacts: [] });
+  }
+
+  // Optional per-account scoping. SECURITY: the requested id must be one of
+  // the authenticated user's own accounts - anything else is a 404.
+  const requestedAccountId = new URL(request.url).searchParams.get('accountId');
+  let scopedIds = accountIds;
+  if (requestedAccountId) {
+    if (!accountIds.includes(requestedAccountId)) {
+      return Response.json({ error: 'Conta do Instagram não encontrada' }, { status: 404 });
+    }
+    scopedIds = [requestedAccountId];
+  }
+
+  const { data, error } = await db
+    .from('contacts')
+    .select(`
+      id, instagram_account_id, audience_ig_user_id, username, follows_business,
+      first_interaction_at, last_interaction_at, last_trigger_type, total_triggers,
+      automations ( id, name )
+    `)
+    .in('instagram_account_id', scopedIds)
+    .order('last_interaction_at', { ascending: false })
+    .limit(500);
+
+  if (error) {
+    logger.error({ err: error, userId: user.id }, 'Falha ao buscar os contatos');
+    return Response.json({ error: 'Falha ao buscar os contatos' }, { status: 500 });
+  }
+
+  return Response.json({ contacts: data ?? [] });
+}
